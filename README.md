@@ -2,6 +2,9 @@
 
 A simple Tkinter-based application that lets you download Spotify playlists track‑by‑track using [spotDL](https://github.com/spotDL/spotify-downloader) and the Spotify Web API (via [Spotipy](https://spotipy.readthedocs.io/)).
 
+![image](https://github.com/user-attachments/assets/a926c267-b6a9-4987-9f6e-747587d597ca)
+
+
 ---
 
 ## Features
