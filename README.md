@@ -15,8 +15,6 @@ A simple Tkinter-based application that lets you download Spotify playlists trac
 - Automatic organization: saves into `DownloadFolder/PlaylistName/XX - TrackTitle.mp3`  
 - Customizable audio bitrate (default: 192 kbps)  
 
-Exe Download: https://github.com/Kavex/Spotify-Playlist-Downloader/releases
-
 ---
 
 ## Prerequisites
