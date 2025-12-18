@@ -12,7 +12,7 @@ A simple Tkinter-based application that lets you download Spotify playlists trac
 - **GUI interface** with fields for Spotify **Client ID**, **Client Secret**, **Playlist URL**, and **Download Folder**  
 - Sequential download of each track in a playlist  
 - Real-time console log inside the app window  
-- Automatic organization: saves into `DownloadFolder/PlaylistName/XX - TrackTitle.mp3`  
+- Automatic organization: saves into `DownloadFolder/Artist/Artist - TrackTitle.mp3`  
 - Customizable audio bitrate (default: 192 kbps)  
 
 ---
