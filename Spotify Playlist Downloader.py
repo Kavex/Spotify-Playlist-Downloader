@@ -2,153 +2,252 @@
 
 import os
 import sys
+import json
+import time
+import asyncio
 import threading
 import subprocess
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
+from concurrent.futures import ThreadPoolExecutor
 
+import spotipy
+from spotipy.oauth2 import SpotifyClientCredentials
 
-def log_message(message):
-    """Append a line of text to the console output."""
-    console_text.insert(tk.END, message + "\n")
+# ======================
+# CONFIG
+# ======================
+SPOTIFY_API_DELAY = 30
+MAX_DOWNLOAD_WORKERS = 3
+BITRATE = "192k"
+CACHE_DIR = "spotify_cache"
+
+SpotClientID = "Client ID Here"
+SpotClientSecret = "Client Secret Here"
+
+# ======================
+# GUI LOGGING
+# ======================
+def log_message(msg):
+    console_text.insert(tk.END, msg + "\n")
     console_text.see(tk.END)
 
+# ======================
+# UTIL
+# ======================
+def safe_name(name):
+    return "".join(c for c in name if c not in r'\/:*?"<>|').strip()
 
-def download_playlist():
-    # Gather inputs
-    playlist_url = url_entry.get().strip()
-    client_id = client_id_entry.get().strip()
-    client_secret = client_secret_entry.get().strip()
+# ======================
+# SPOTIFY RATE LIMITER
+# ======================
+class SpotifyRateLimiter:
+    def __init__(self, delay):
+        self.delay = delay
+        self.last_call = 0
+        self.lock = asyncio.Lock()
 
-    if not playlist_url:
-        messagebox.showerror("Error", "Please enter a Spotify playlist URL")
+    async def call(self, fn, *args, **kwargs):
+        async with self.lock:
+            elapsed = time.time() - self.last_call
+            if elapsed < self.delay:
+                await asyncio.sleep(self.delay - elapsed)
+
+            result = fn(*args, **kwargs)
+            self.last_call = time.time()
+            return result
+
+# ======================
+# CACHE
+# ======================
+def cache_path(playlist_id):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    return os.path.join(CACHE_DIR, f"{playlist_id}.json")
+
+def load_cache(playlist_id):
+    path = cache_path(playlist_id)
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
+def save_cache(playlist_id, data):
+    with open(cache_path(playlist_id), "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+# ======================
+# SPOTIFY → QUEUE
+# ======================
+async def fetch_tracks(sp, limiter, playlist_id, queue):
+    cached = load_cache(playlist_id)
+    if cached:
+        log_message("📦 Loaded playlist metadata from cache")
+        for track in cached["tracks"]:
+            await queue.put(track)
         return
 
-    if not client_id or not client_secret:
-        messagebox.showerror(
-            "Error",
-            "Please enter both Spotify Client ID and Client Secret"
+    log_message("🌐 Fetching playlist metadata (rate-limited)")
+    meta = await limiter.call(sp.playlist, playlist_id, fields=["name"])
+    log_message(f"🎵 Playlist: {meta['name']}")
+
+    results = await limiter.call(sp.playlist_items, playlist_id)
+    tracks = []
+
+    while True:
+        for item in results["items"]:
+            track = item.get("track")
+            if not track:
+                continue
+
+            artist = track["artists"][0]["name"] if track["artists"] else "Unknown Artist"
+
+            tracks.append({
+                "url": track["external_urls"]["spotify"],
+                "artist": artist,
+                "title": track["name"]
+            })
+
+        if not results["next"]:
+            break
+        results = await limiter.call(sp.next, results)
+
+    save_cache(playlist_id, {"tracks": tracks})
+    log_message(f"💾 Cached {len(tracks)} tracks")
+
+    for t in tracks:
+        await queue.put(t)
+
+# ======================
+# SPOTDL EXECUTION
+# ======================
+def run_spotdl(track, base_folder, worker_id):
+    artist = safe_name(track["artist"])
+    out_dir = os.path.join(base_folder, artist)
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Template without .mp3 (spotdl adds it automatically)
+    output_template = os.path.join(out_dir, "{artist} - {title}")
+
+    cmd = [
+        sys.executable, "-m", "spotdl", "download",
+        track["url"],
+        "--format", "mp3",
+        "--bitrate", BITRATE,
+        "--output", output_template,
+        "--overwrite", "skip"
+    ]
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True
+    )
+
+    for line in proc.stdout:
+        log_message(f"[W{worker_id}] {line.rstrip()}")
+
+    proc.wait()
+    return proc.returncode
+
+# ======================
+# WORKER
+# ======================
+async def download_worker(worker_id, queue, folder, executor):
+    loop = asyncio.get_running_loop()
+    while True:
+        track = await queue.get()
+        log_message(f"[W{worker_id}] ⬇️ {track['artist']} – {track['title']}")
+        code = await loop.run_in_executor(
+            executor,
+            run_spotdl,
+            track,
+            folder,
+            worker_id
         )
-        return
+        if code == 0:
+            log_message(f"[W{worker_id}] ✅ Completed")
+        else:
+            log_message(f"[W{worker_id}] ❌ Failed")
+        queue.task_done()
 
+# ======================
+# ASYNC CONTROLLER
+# ======================
+async def async_controller(playlist_id, sp, folder):
+    limiter = SpotifyRateLimiter(SPOTIFY_API_DELAY)
+    queue = asyncio.Queue()
+
+    executor = ThreadPoolExecutor(max_workers=MAX_DOWNLOAD_WORKERS)
+    workers = [
+        asyncio.create_task(download_worker(i + 1, queue, folder, executor))
+        for i in range(MAX_DOWNLOAD_WORKERS)
+    ]
+
+    await fetch_tracks(sp, limiter, playlist_id, queue)
+    await queue.join()
+
+    for w in workers:
+        w.cancel()
+    executor.shutdown(wait=False)
+
+# ======================
+# TK CALLBACK
+# ======================
+def download_playlist():
+    playlist_url = url_entry.get().strip()
     folder = folder_path.get()
-    if not folder:
-        messagebox.showerror("Error", "Please select a download folder")
+
+    if not playlist_url or not folder:
+        messagebox.showerror("Error", "Missing playlist URL or folder")
         return
 
-    log_message(f"📂 Downloading playlist to: {folder}")
-    log_message(f"🔗 Spotify URL: {playlist_url}")
+    playlist_id = playlist_url.rstrip("/").split("/")[-1].split("?")[0]
 
-    def run_sequential():
+    def runner():
         try:
-            import spotipy
-            from spotipy.oauth2 import SpotifyClientCredentials
-
-            auth_manager = SpotifyClientCredentials(
-                client_id=client_id,
-                client_secret=client_secret
+            auth = SpotifyClientCredentials(
+                client_id=client_id_entry.get().strip(),
+                client_secret=client_secret_entry.get().strip()
             )
-            sp = spotipy.Spotify(auth_manager=auth_manager)
-
-            # Extract playlist ID and fetch metadata
-            pid = playlist_url.rstrip('/').split('/')[-1].split('?')[0]
-            meta = sp.playlist(pid, fields=['name'])
-            pl_name = meta['name']
-
-            # Fetch tracks
-            items = []
-            results = sp.playlist_items(pid)
-            items.extend(results['items'])
-            while results['next']:
-                results = sp.next(results)
-                items.extend(results['items'])
-
-            total = len(items)
-            log_message(f"🎵 Found {total} tracks in '{pl_name}'")
-
-            bitrate = "192k"
-            for idx, entry in enumerate(items, start=1):
-                track = entry['track']
-                t_url = track['external_urls']['spotify']
-                title = track.get('name', 'unknown')
-                num = f"{idx:02d}"
-                out_dir = os.path.join(folder, pl_name)
-                os.makedirs(out_dir, exist_ok=True)
-                filename = f"{num} - {title}.mp3"
-                out_path = os.path.join(out_dir, filename)
-
-                log_message(f"⬇️ [{idx}/{total}] {title}")
-                cmd = [
-                    sys.executable,
-                    "-m", "spotdl", "download", t_url,
-                    "--bitrate", bitrate,
-                    "--output", out_path
-                ]
-
-                proc = subprocess.Popen(
-                    cmd, stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT, text=True
-                )
-                for line in proc.stdout:
-                    log_message(line.rstrip())
-                proc.wait()
-
-                if proc.returncode != 0:
-                    log_message(f"❌ Failed: {title} (code {proc.returncode})")
-                else:
-                    log_message(f"✅ Completed: {title}")
-
-            messagebox.showinfo("Success", "All tracks processed")
+            sp = spotipy.Spotify(auth_manager=auth)
+            asyncio.run(async_controller(playlist_id, sp, folder))
+            messagebox.showinfo("Done", "All downloads completed")
         except Exception as e:
-            log_message(f"❌ Error: {e}")
+            log_message(f"❌ {e}")
             messagebox.showerror("Error", str(e))
 
-    threading.Thread(target=run_sequential, daemon=True).start()
+    threading.Thread(target=runner, daemon=True).start()
 
-
-def choose_folder():
-    selected = filedialog.askdirectory()
-    if selected:
-        folder_path.set(selected)
-
-# --- GUI Setup ---
+# ======================
+# GUI
+# ======================
 root = tk.Tk()
 root.title("Spotify Playlist Downloader")
-root.geometry("640x600")
+root.geometry("780x650")
 
-# Credentials frame
-cred_frame = tk.Frame(root)
-cred_frame.pack(pady=10)
+tk.Label(root, text="Client ID").pack()
+client_id_entry = tk.Entry(root, width=75)
+client_id_entry.insert(0, SpotClientID)
+client_id_entry.pack()
 
-tk.Label(cred_frame, text="Client ID:").grid(row=0, column=0, sticky="e", padx=5)
-client_id_entry = tk.Entry(cred_frame, width=40)
-client_id_entry.grid(row=0, column=1, pady=2)
+tk.Label(root, text="Client Secret").pack()
+client_secret_entry = tk.Entry(root, width=75)
+client_secret_entry.insert(0, SpotClientSecret)
+client_secret_entry.pack()
 
-tk.Label(cred_frame, text="Client Secret:").grid(row=1, column=0, sticky="e", padx=5)
-client_secret_entry = tk.Entry(cred_frame, show="*", width=40)
-client_secret_entry.grid(row=1, column=1, pady=2)
+tk.Label(root, text="Spotify Playlist URL").pack()
+url_entry = tk.Entry(root, width=85)
+url_entry.pack()
 
-# Spotify URL input
-tk.Label(root, text="Spotify Playlist URL:").pack(pady=5)
-url_entry = tk.Entry(root, width=60)
-url_entry.pack(pady=5)
-
-# Folder chooser
-tk.Label(root, text="Download Folder:").pack(pady=5)
 folder_path = tk.StringVar()
-tk.Entry(root, textvariable=folder_path, width=45, state="readonly").pack(pady=5)
-tk.Button(root, text="Choose Folder", command=choose_folder).pack(pady=5)
+tk.Label(root, text="Download Folder").pack()
+tk.Entry(root, textvariable=folder_path, width=70, state="readonly").pack()
+tk.Button(root, text="Choose Folder", command=lambda: folder_path.set(filedialog.askdirectory())).pack()
 
-# Download button
-tk.Button(
-    root, text="Download Playlist",
-    command=download_playlist,
-    bg="green", fg="white"
-).pack(pady=10)
+tk.Button(root, text="Download Playlist", bg="green", fg="white", command=download_playlist).pack(pady=10)
 
-# Console output area
-tk.Label(root, text="Console:").pack(pady=5)
-console_text = scrolledtext.ScrolledText(root, width=80, height=20)
-console_text.pack(pady=5)
+console_text = scrolledtext.ScrolledText(root, width=100, height=28)
+console_text.pack()
 
 root.mainloop()
